@@ -1,16 +1,17 @@
 package main
 
 import (
-	"crypto/tls"
+	"context"
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tevino/tcp-shaker"
 )
 
 var (
@@ -30,7 +31,7 @@ var (
 
 type response struct {
 	URL      string
-	Response *http.Response
+	Response int
 	Err      error
 }
 
@@ -68,12 +69,15 @@ func main() {
 	}
 
 	matches := urlRE.FindAllString(string(file), -1)
-	client := &http.Client{
-		Timeout: *timeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	c := tcp.NewChecker()
+
+	ctx, stopChecker := context.WithCancel(context.Background())
+	defer stopChecker()
+	go func() {
+		if err := c.CheckingLoop(ctx); err != nil {
+			fmt.Println("checking loop stopped due to fatal error: ", err)
+		}
+	}()
 
 	results := make(chan *response)
 
@@ -85,7 +89,8 @@ func main() {
 			continue
 		}
 		counter++
-		go worker(u, results, client)
+		<-c.WaitReady()
+		go worker2(u, results, c)
 	}
 	fmt.Printf("Found %d URIs\n", len(matches))
 
@@ -93,22 +98,22 @@ func main() {
 	for counter > 0 {
 		resp := <-results
 		counter--
-		if resp.Err != nil && resp.Response == nil {
+		if resp.Err != nil && resp.Response != 200 {
 			fmt.Printf("[%s] %s\n", fmt.Sprintf(errorStrColor, "ERROR"), resp.Err.Error())
 			totalErrors++
 			continue
 		}
 
-		shouldSkipURL := len(skipped) > 0 && isIn(resp.Response.StatusCode, skipped)
+		shouldSkipURL := len(skipped) > 0 && isIn(resp.Response, skipped)
 		statusColor := okColor
-		if resp.Response.StatusCode > 400 && !shouldSkipURL {
+		if resp.Err != nil && !shouldSkipURL {
 			statusColor = errorColor
 			totalErrors++
 		} else if shouldSkipURL {
 			statusColor = debugColor
 		}
 
-		fmt.Printf("[%s] %s \n", fmt.Sprintf(statusColor, resp.Response.StatusCode), resp.URL)
+		fmt.Printf("[%s] %s \n", fmt.Sprintf(statusColor, resp.Response), resp.URL)
 	}
 
 	if totalErrors > 0 {
@@ -117,25 +122,28 @@ func main() {
 	}
 }
 
-func worker(url string, results chan<- *response, client *http.Client) {
+func worker2(url string, results chan<- *response, c *tcp.Checker) {
 	response := &response{
 		URL: url,
 	}
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		response.Err = err
-		return
+
+	runes := []rune(url)
+	if runes[len(runes)-1] == '/' {
+		url = string(runes[0 : len(runes)-1])
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		response.Err = err
-		results <- response
-		return
-	}
-	defer resp.Body.Close()
+	timeout := time.Second * 1
+	err := c.CheckAddr(url+":80", timeout)
 
-	response.Response = resp
+	switch err {
+	case tcp.ErrTimeout:
+		response.Err = err
+	case nil:
+		response.Response = 200
+	default:
+		response.Err = err
+	}
+
 	results <- response
 }
 
